@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Blender Unity Bridge",
-    "author": "ChatGPT6.1 Sol",
-    "version": (1, 0, 1),
+    "author": "GPT-6.1 sol",
+    "version": (1, 0, 2),
     "blender": (4, 5, 0),
     "location": "View3D > Sidebar > Unity Export",
     "description": "Export selected static meshes and materials to Unity URP",
@@ -48,6 +48,7 @@ class Exporter:
         self.limit = limit
         self.warnings = []
         self.samples = {}
+        self.diagnostics = []
         (folder / "Textures").mkdir(exist_ok=True)
 
     def source(self, socket, label):
@@ -62,41 +63,81 @@ class Exporter:
                 self.warnings.append(label + ": wrapping will be Repeat.")
         return source
 
-    def save_image(self, image, stem, opaque=False):
-        if not image.size[0] or not image.size[1]:
-            raise RuntimeError("Image has no pixel data: " + image.name)
+    def write_pixels(self, width, height, pixels, stem, colorspace, packed=False):
+        """Explicitly fill a fresh image. Do not use Image.copy() for edited buffers."""
         relative = "Textures/" + stem + ".png"
-        copy = image.copy()
+        image = bpy.data.images.new(
+            "UnityBridge_Temporary", width=width, height=height,
+            alpha=True, float_buffer=True,
+        )
         try:
-            if opaque:
-                values = list(copy.pixels[:])
-                values[3::4] = [1.0] * (len(values) // 4)
-                copy.pixels.foreach_set(values)
-            w, h = copy.size
-            factor = min(1.0, self.limit / max(w, h))
+            image.colorspace_settings.name = colorspace
+            image.alpha_mode = "CHANNEL_PACKED" if packed else "STRAIGHT"
+            image.pixels.foreach_set(pixels)
+            image.update()
+            factor = min(1.0, self.limit / max(width, height))
             if factor < 1:
-                copy.scale(max(1, round(w * factor)), max(1, round(h * factor)))
-            copy.filepath_raw = str(self.folder / relative)
-            copy.file_format = "PNG"
-            copy.save()
+                image.scale(max(1, round(width * factor)), max(1, round(height * factor)))
+                image.update()
+            image.filepath_raw = str(self.folder / relative)
+            image.file_format = "PNG"
+            # Image.save(), not save_render(): avoid scene view-transform baking.
+            image.save()
         finally:
-            bpy.data.images.remove(copy)
+            bpy.data.images.remove(image)
         return relative
+
+    def save_image(self, image, stem, opaque=False):
+        width, height = image.size
+        if not width or not height:
+            raise RuntimeError("Image has no pixel data: " + image.name)
+        if image.source not in {"FILE", "GENERATED"}:
+            raise RuntimeError("Unsupported image source (use single images): " + image.name)
+        pixels = list(image.pixels[:])
+        if len(pixels) != width * height * 4:
+            raise RuntimeError("Unexpected image pixel buffer: " + image.name)
+        if opaque:
+            pixels[3::4] = [1.0] * (width * height)
+        return self.write_pixels(width, height, pixels, stem, image.colorspace_settings.name)
 
     def sample(self, source, x, y, w, h):
         image, channel, _ = source
         key = image.as_pointer()
         if key not in self.samples:
-            self.samples[key] = (image.size[0], image.size[1], list(image.pixels[:]))
+            iw, ih = image.size
+            pixels = list(image.pixels[:])
+            if not iw or not ih or len(pixels) != iw * ih * 4:
+                raise RuntimeError("Missing or unsupported image pixels: " + image.name)
+            self.samples[key] = (iw, ih, pixels)
         iw, ih, pixels = self.samples[key]
-        if not iw or not ih:
-            raise RuntimeError("Image has no pixel data: " + image.name)
         ix = min(iw - 1, int((x + 0.5) * iw / w))
         iy = min(ih - 1, int((y + 0.5) * ih / h))
         k = (iy * iw + ix) * 4
         if channel in ("R", "G", "B", "A"):
             return pixels[k + "RGBA".index(channel)]
         return 0.2126 * pixels[k] + 0.7152 * pixels[k + 1] + 0.0722 * pixels[k + 2]
+
+    def verify_packed(self, relative, material_name):
+        """Read the saved file back: detect lost alpha instead of silent failure."""
+        image = bpy.data.images.load(str(self.folder / relative), check_existing=False)
+        try:
+            image.colorspace_settings.name = "Non-Color"
+            image.alpha_mode = "CHANNEL_PACKED"
+            values = list(image.pixels[:])
+            alphas = values[3::4]
+            if not alphas:
+                raise RuntimeError("Saved packed texture has no readable pixels.")
+            minimum, maximum = min(alphas), max(alphas)
+            average = sum(alphas) / len(alphas)
+            self.diagnostics.append(
+                f"{material_name}: saved PNG smoothness alpha "
+                f"min={minimum:.4f}, max={maximum:.4f}, mean={average:.4f}; "
+                f"channels={image.channels}; file={relative}"
+            )
+            if image.channels != 4:
+                raise RuntimeError("Packed PNG lost its alpha channel: " + relative)
+        finally:
+            bpy.data.images.remove(image)
 
     def material(self, mat):
         if not mat.get("unity_bridge_id"):
@@ -142,6 +183,9 @@ class Exporter:
         rsrc = self.source(rough, mat.name + " / Roughness")
         record["metallic"] = float(met.default_value)
         record["smoothness"] = 1 - float(rough.default_value)
+        for label, src in (("Metallic", msrc), ("Roughness", rsrc)):
+            if src and src[0].colorspace_settings.name != "Non-Color":
+                self.warnings.append(mat.name + " / " + label + ": use Non-Color for data textures; source currently uses " + src[0].colorspace_settings.name)
         if msrc or rsrc:
             sizes = [s[0].size[:] for s in (msrc, rsrc) if s]
             w, h = max(s[0] for s in sizes), max(s[1] for s in sizes)
@@ -150,20 +194,28 @@ class Exporter:
             factor = min(1.0, self.limit / max(w, h))
             w, h = max(1, round(w * factor)), max(1, round(h * factor))
             values = []
+            smin, smax, total = 1.0, 0.0, 0.0
             for y in range(h):
                 for x in range(w):
                     metallic = self.sample(msrc, x, y, w, h) if msrc else float(met.default_value)
                     roughness = self.sample(rsrc, x, y, w, h) if rsrc else float(rough.default_value)
-                    values.extend((max(0, min(1, metallic)), 1, 0, max(0, min(1, 1 - roughness))))
-            image = bpy.data.images.new(stem + "_MetalSmooth", width=w, height=h, alpha=True)
-            try:
-                image.colorspace_settings.name = "Non-Color"
-                image.pixels.foreach_set(values)
-                record["metallicTexture"] = self.save_image(image, stem + "_MetalSmooth")
-            finally:
-                bpy.data.images.remove(image)
+                    smoothness = max(0.0, min(1.0, 1.0 - roughness))
+                    # R: metallic. G/B: unused by URP/Lit. A: smoothness.
+                    values.extend((max(0.0, min(1.0, metallic)), 0.0, 0.0, smoothness))
+                    smin = min(smin, smoothness)
+                    smax = max(smax, smoothness)
+                    total += smoothness
+            self.diagnostics.append(
+                f"{mat.name}: calculated smoothness "
+                f"min={smin:.4f}, max={smax:.4f}, mean={total/(w*h):.4f}"
+            )
+            relative = self.write_pixels(w, h, values, stem + "_MetalSmooth", "Non-Color", packed=True)
+            record["metallicTexture"] = relative
+            self.verify_packed(relative, mat.name)
             record["metallic"] = 1
             record["smoothness"] = 1
+        else:
+            self.diagnostics.append(f"{mat.name}: scalar smoothness={record['smoothness']:.4f}")
         if ins["Normal"].is_linked:
             normal = ins["Normal"].links[0].from_node
             if normal.type == "NORMAL_MAP" and normal.space == "TANGENT":
@@ -219,6 +271,7 @@ class UNITYBRIDGE_OT_export(bpy.types.Operator):
         folder = root / name
         original = list(context.selected_objects)
         active = context.view_layer.objects.active
+        exporter = None
         try:
             folder.mkdir(parents=True, exist_ok=True)
             exporter = Exporter(folder, settings.max_size)
@@ -251,11 +304,13 @@ class UNITYBRIDGE_OT_export(bpy.types.Operator):
                 path_mode="STRIP", embed_textures=False, bake_anim=False, add_leaf_bones=False,
             )
             (folder / "ExportWarnings.txt").write_text("\n".join(exporter.warnings) or "No detected warnings.", encoding="utf-8")
-            self.report({"INFO"}, f"Exported {len(objects)} meshes; {len(exporter.warnings)} warnings. See ExportWarnings.txt.")
+            self.report({"INFO"}, f"Exported {len(objects)} meshes; {len(exporter.warnings)} warnings. See ExportWarnings.txt and ExportDiagnostics.txt.")
         except Exception as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
         finally:
+            if exporter:
+                (folder / "ExportDiagnostics.txt").write_text("\n".join(exporter.diagnostics) or "No completed diagnostics.", encoding="utf-8")
             bpy.ops.object.select_all(action="DESELECT")
             for obj in original:
                 obj.select_set(True)
@@ -279,6 +334,7 @@ class UNITYBRIDGE_PT_panel(bpy.types.Panel):
         col.prop(settings, "lightmap_uv")
         col.operator("unity_bridge.export", icon="EXPORT")
         col.label(text="Static meshes / Principled BSDF")
+        col.label(text="v1.0.2: packed alpha verification")
 
 
 classes = (BridgeSettings, UNITYBRIDGE_OT_export, UNITYBRIDGE_PT_panel)
