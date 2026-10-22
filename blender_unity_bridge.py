@@ -1,6 +1,6 @@
 bl_info = {
     "name": "Blender Unity Bridge",
-    "author": "OpenAI",
+    "author": "ChatGPT6.1 Sol",
     "version": (1, 0, 1),
     "blender": (4, 5, 0),
     "location": "View3D > Sidebar > Unity Export",
